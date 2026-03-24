@@ -3,3 +3,4 @@ SELECT * FROM children WHERE age = 3 FORMAT `Null` SETTINGS log_comment = \'2\'	
 SELECT * FROM children WHERE startsWith(name, \'Al\') FORMAT `Null` SETTINGS log_comment = \'3\'	['default.children.name_i']
 SELECT * FROM children WHERE (age = 3) AND (name = \'Alice\') FORMAT `Null` SETTINGS log_comment = \'4\'	['default.children.age_i','default.children.name_i']
 SELECT * FROM children LEFT JOIN parents ON children.parent_id = parents.uid WHERE (parents.age >= 25) AND (children.name = \'Alice\') FORMAT `Null` SETTINGS log_comment = \'5\'	['default.children.name_i','default.parents.age_i']
+SELECT * FROM `hello, world` WHERE age = 30 FORMAT `Null` SETTINGS log_comment = \'6\'	['default.`hello, world`.`my.favorite.index`']

@@ -2575,7 +2575,7 @@ void Context::addSkipIndexAccessInfo(const String & full_table_name, const Strin
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have query access info");
 
     std::lock_guard lock(query_access_info->mutex);
-    query_access_info->skip_indices.emplace(full_table_name + "." + skip_index_name);
+    query_access_info->skip_indices.emplace(full_table_name + "." + backQuoteIfNeed(skip_index_name));
 }
 
 Context::QueryFactoriesInfo Context::getQueryFactoriesInfo() const
