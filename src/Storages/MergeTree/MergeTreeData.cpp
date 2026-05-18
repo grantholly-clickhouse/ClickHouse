@@ -1793,6 +1793,32 @@ void MergeTreeData::PartLoadingTree::add(const MergeTreePartInfo & info, const S
         return part_disk->existsFile(fs::path(relative_data_path) / part_name / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
     };
 
+    /// Without merge coordination on plain_rewritable disks, two replicas can independently
+    /// schedule a merge over overlapping subsets of the same level-`L` input parts and
+    /// each commit a level-`L+1` output part. The two outputs share `min_block` but have
+    /// different `max_block`; their ranges intersect without either strictly
+    /// containing the other (per `MergeTreePartInfo::contains`, which requires
+    /// `level > rhs.level` for non-equal ranges). The next `ATTACH TABLE` throws
+    /// `LOGICAL_ERROR` and wedges the table on every retry.
+    ///
+    /// The wider output (larger block range) is a superset of the narrower one in
+    /// terms of source data covered: it's the result of a merge whose input set is
+    /// a superset of the narrower merge's input set. Treating the narrower part as
+    /// outdated and keeping the wider one is data-safe.
+    auto is_plain_rewritable = [](const DiskPtr & part_disk)
+    {
+        return part_disk
+            && part_disk->getDataSourceDescription().metadata_type == MetadataStorageType::PlainRewritable;
+    };
+    /// Check that the `wider` part covers a larger block range than the `narrower` part
+    /// at the same partition, level, and mutation.
+    auto superset_of_same_level_block_range = [](const MergeTreePartInfo & wider, const MergeTreePartInfo & narrower)
+    {
+        return wider.getPartitionId() == narrower.getPartitionId()
+            && wider.level == narrower.level && wider.mutation == narrower.mutation
+            && wider.min_block == narrower.min_block && wider.max_block > narrower.max_block;
+    };
+
     auto * current = current_ptr.get();
     while (true)
     {
@@ -1820,6 +1846,20 @@ void MergeTreeData::PartLoadingTree::add(const MergeTreePartInfo & info, const S
                         name, prev->second->name);
                     return;
                 }
+                if (is_plain_rewritable(disk) && is_plain_rewritable(prev->second->disk)
+                    && superset_of_same_level_block_range(prev_info, info))
+                {
+                    /// If two parts of the same partition and level exist and one is a superset
+                    /// of the other, then we will treat the narrower part that is subsumed by the
+                    /// wider superset part as outdated and skip it.
+                    LOG_WARNING(getLogger("MergeTreeData"),
+                        "Part {} on plain_rewritable disk is subsumed by previous same-level part {}: "
+                        "treating it as a concurrent-merge artefact and marking it outdated. "
+                        "This typically indicates two replicas committed overlapping merges on a shared object-storage prefix.",
+                        name, prev->second->name);
+                    current = prev->second.get();
+                    continue;
+                }
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "Part {} intersects previous part {}. It is a bug or a result of manual intervention",
                     name, prev->second->name);
@@ -1843,6 +1883,17 @@ void MergeTreeData::PartLoadingTree::add(const MergeTreePartInfo & info, const S
                         " and one of them has transaction metadata (likely a rolled-back transaction)",
                         name, it->second->name);
                     return;
+                }
+                if (is_plain_rewritable(disk) && is_plain_rewritable(it->second->disk)
+                    && superset_of_same_level_block_range(next_info, info))
+                {
+                    LOG_WARNING(getLogger("MergeTreeData"),
+                        "Part {} on plain_rewritable disk is subsumed by next same-level part {}: "
+                        "treating it as a concurrent-merge artefact and marking it outdated. "
+                        "This typically indicates two replicas committed overlapping merges on a shared object-storage prefix.",
+                        name, it->second->name);
+                    current = it->second.get();
+                    continue;
                 }
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "Part {} intersects next part {}. It is a bug or a result of manual intervention",
@@ -1874,9 +1925,17 @@ void MergeTreeData::PartLoadingTree::traverse(bool recursive, Func && func)
 MergeTreeData::PartLoadingTree
 MergeTreeData::PartLoadingTree::build(PartLoadingInfos nodes, const String & relative_data_path_)
 {
+    /// Sort by `(level, mutation)` descending so that covering parts are inserted
+    /// into the tree before covered parts. Use block-range width as a tiebreaker
+    /// so the wider of two same-level parts is inserted first; this makes the
+    /// `add` recovery path for concurrent-merge artefacts on `plain_rewritable`
+    /// storage deterministic regardless of directory-iteration order.
     std::sort(nodes.begin(), nodes.end(), [](const auto & lhs, const auto & rhs)
     {
-        return std::tie(lhs.info.level, lhs.info.mutation) > std::tie(rhs.info.level, rhs.info.mutation);
+        auto lhs_width = lhs.info.max_block - lhs.info.min_block;
+        auto rhs_width = rhs.info.max_block - rhs.info.min_block;
+        return std::tie(lhs.info.level, lhs.info.mutation, lhs_width)
+             > std::tie(rhs.info.level, rhs.info.mutation, rhs_width);
     });
 
     PartLoadingTree tree;
